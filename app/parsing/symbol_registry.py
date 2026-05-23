@@ -249,6 +249,28 @@ class SymbolRegistry:
         if not raw_name:
             return None, ResolutionType.UNRESOLVED
 
+        # --- 0. Framework / Callable Instance Call Resolution ---
+        # e.g., model(x) where model maps to a class like GPT, or self(x)
+        if "." not in raw_name:
+            if raw_name == "self" and calling_class_qn:
+                forward_qn = f"{calling_class_qn}.forward"
+                if forward_qn in self._symbols:
+                    return forward_qn, ResolutionType.DIRECT
+                call_qn = f"{calling_class_qn}.__call__"
+                if call_qn in self._symbols:
+                    return call_qn, ResolutionType.DIRECT
+            
+            elif fn_assignments and raw_name in fn_assignments:
+                raw_class = fn_assignments[raw_name]
+                resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                if resolved_class:
+                    forward_qn = f"{resolved_class}.forward"
+                    if forward_qn in self._symbols:
+                        return forward_qn, ResolutionType.HEURISTIC
+                    call_qn = f"{resolved_class}.__call__"
+                    if call_qn in self._symbols:
+                        return call_qn, ResolutionType.HEURISTIC
+
         # --- 1. Direct import map ---
         if raw_name in import_map:
             candidate = import_map[raw_name]
@@ -260,11 +282,23 @@ class SymbolRegistry:
             prefix = parts[0]
             method = parts[1]
 
-            # 2a. Calls to self: self.my_method()
+            # 2a. Calls to self: self.my_method() or self.model()
             if prefix == "self" and calling_class_qn:
                 candidate = f"{calling_class_qn}.{method}"
                 if candidate in self._symbols:
                     return candidate, ResolutionType.DIRECT
+                
+                # Check if it is a self attribute call (like self.model()) mapping to a callable class
+                if class_assignments and raw_name in class_assignments:
+                    raw_class = class_assignments[raw_name]
+                    resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                    if resolved_class:
+                        forward_qn = f"{resolved_class}.forward"
+                        if forward_qn in self._symbols:
+                            return forward_qn, ResolutionType.HEURISTIC
+                        call_qn = f"{resolved_class}.__call__"
+                        if call_qn in self._symbols:
+                            return call_qn, ResolutionType.HEURISTIC
 
             # 2b. Calls to self attribute: self.model.forward()
             elif prefix.startswith("self.") and class_assignments and prefix in class_assignments:

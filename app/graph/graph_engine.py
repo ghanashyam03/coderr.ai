@@ -87,6 +87,37 @@ def _is_api_route_node(data: dict[str, Any]) -> bool:
     return False
 
 
+def _is_framework_entrypoint(data: dict[str, Any]) -> bool:
+    """
+    Check if a node data dict represents a framework-managed entry point.
+    Matches API routes (FastAPI/Flask/Django), CLI commands (Typer/Click),
+    and task definitions (Celery).
+    """
+    decorators: list[str] = data.get("decorators", [])
+    for dec in decorators:
+        dec_lower = dec.lower()
+        # Route patterns
+        route_patterns = ("route", "get", "post", "put", "delete", "patch", "head", "options", "websocket")
+        if any(pat in dec_lower for pat in route_patterns):
+            return True
+        # CLI command patterns
+        cli_patterns = ("command", "cli", "option", "argument")
+        if any(pat in dec_lower for pat in cli_patterns):
+            return True
+        # Task patterns
+        task_patterns = ("task", "shared_task")
+        if any(pat in dec_lower for pat in task_patterns):
+            return True
+
+    # Naming conventions
+    name_lower = data.get("name", "").lower()
+    if name_lower in ("main", "run", "start", "execute", "handler", "entrypoint"):
+        return True
+
+    return False
+
+
+
 # ---------------------------------------------------------------------------
 # CodeGraph
 # ---------------------------------------------------------------------------
@@ -722,7 +753,7 @@ class CodeGraph:
         # 5. Dead Code Candidates (in-degree == 0, not entrypoint, not route)
         dead_candidates = []
         for nid, data in self.graph.nodes(data=True):
-            if data.get("node_type") in ("function", "class") and not _is_api_route_node(data):
+            if data.get("node_type") in ("function", "class") and not _is_framework_entrypoint(data):
                 in_deg = call_graph.in_degree(nid) if nid in call_graph else 0
                 name_lower = data.get("name", "").lower()
                 is_main = name_lower in ("main", "run", "start")

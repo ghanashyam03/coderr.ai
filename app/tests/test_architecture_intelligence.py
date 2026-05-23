@@ -367,3 +367,92 @@ def test_path_confidence_scoring_and_helper_suppression(sample_arch_repo) -> Non
     symbols = classified["symbols"]
     assert sym_dead not in symbols["IMPLEMENTATION DETAILS"]
 
+
+def test_pytorch_instance_resolution() -> None:
+    """Validate that calling a PyTorch module instance (e.g. model(x)) maps heuristically to class.forward."""
+    p1 = "/repo/app/models.py"
+    p2 = "/repo/app/main.py"
+    m1 = "app.models"
+    m2 = "app.main"
+
+    # Define GPT model class with a forward method
+    forward_fn = _fn("forward", m1, p1, class_name="GPT", line_start=5, line_end=10, source="def forward(self, x): return x")
+    gpt_class = _cls("GPT", m1, p1, methods=[forward_fn])
+    
+    f1 = ParsedFile(
+        path=p1,
+        module_name=m1,
+        classes=[gpt_class]
+    )
+
+    # main.py does: model = GPT(); model(x)
+    main_fn = ParsedFunction(
+        name="main",
+        qualified_name="app.main.main",
+        file_path=p2,
+        line_start=1,
+        line_end=15,
+        source="def main():\n    model = GPT()\n    output = model(inputs)",
+        calls=[ParsedCall(name="model", line=3)],
+        assignments={"model": "GPT"}  # Local variable assignment
+    )
+
+    f2 = ParsedFile(
+        path=p2,
+        module_name=m2,
+        imports=[
+            ParsedImport(module=m1, names=["GPT"], line=2, is_from=True)
+        ],
+        functions=[main_fn]
+    )
+
+    parsed_files = [f1, f2]
+    registry = build_registry(parsed_files)
+    
+    # Verify that the model call in main.py was resolved to app.models.GPT.forward via heuristics
+    resolved_call = f2.functions[0].calls[0]
+    assert resolved_call.resolved == "app.models.GPT.forward"
+    assert resolved_call.resolution_type.value == "heuristic"
+
+    # Build the CodeGraph and check that the CALLS edge was established
+    graph = CodeGraph()
+    graph.build(parsed_files, registry)
+
+    caller_node = _func_node_id("app.main.main")
+    callee_node = _func_node_id("app.models.GPT.forward")
+    assert graph.graph.has_edge(caller_node, callee_node)
+    assert graph.graph.edges[caller_node, callee_node].get("resolution_type") == "heuristic"
+
+
+def test_framework_entrypoint_filtering() -> None:
+    """Validate that Typer commands and other framework entrypoints are filtered out of dead code candidates."""
+    p1 = "/repo/app/cli.py"
+    m1 = "app.cli"
+
+    # Typer command with @app.command() decorator
+    cli_fn = _fn("run_cli", m1, p1, decorators=["app.command()"], line_start=3, line_end=8, source="@app.command()\ndef run_cli(): pass")
+    
+    # Standard function with no callers
+    dead_fn = _fn("unused_helper", m1, p1, line_start=10, line_end=15, source="def unused_helper(): pass")
+
+    f1 = ParsedFile(
+        path=p1,
+        module_name=m1,
+        functions=[cli_fn, dead_fn]
+    )
+
+    parsed_files = [f1]
+    registry = build_registry(parsed_files)
+    graph = CodeGraph()
+    graph.build(parsed_files, registry)
+
+    analysis = graph.analyze_architecture()
+    dead_candidates = [d["qualified_name"] for d in analysis["dead_code_candidates"]]
+
+    # cli_fn decorated as framework entrypoint should NOT be marked as dead code candidate
+    assert "app.cli.run_cli" not in dead_candidates
+    
+    # unused_helper has no callers/decorators and should be marked as dead code candidate
+    assert "app.cli.unused_helper" in dead_candidates
+
+
