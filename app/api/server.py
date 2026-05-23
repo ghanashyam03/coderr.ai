@@ -83,6 +83,9 @@ class DepsResponse(BaseModel):
     file_path: str
     direct_dependencies: list[str]
     transitive_dependencies: list[str]
+    direction: Optional[str] = "downstream"
+    dependency_depth: Optional[int] = 2
+    edge_metadata: Optional[dict[str, dict]] = None
 
 
 class ImpactResponse(BaseModel):
@@ -202,7 +205,7 @@ def query_repo(request: QueryRequest) -> QueryResponse:
 
 
 @app.get("/dependencies/{repo_name}/{symbol}", response_model=DepsResponse, tags=["Intelligence"])
-def get_dependencies(repo_name: str, symbol: str, depth: int = 2) -> DepsResponse:
+def get_dependencies(repo_name: str, symbol: str, depth: int = 2, direction: str = "downstream") -> DepsResponse:
     """Get the dependency chain for a symbol in a repository."""
     intel = _get_intelligence()
     try:
@@ -210,6 +213,7 @@ def get_dependencies(repo_name: str, symbol: str, depth: int = 2) -> DepsRespons
             repo_name=repo_name,
             symbol_name=symbol,
             depth=depth,
+            direction=direction,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

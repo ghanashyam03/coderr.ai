@@ -56,7 +56,7 @@ You have been given a deeply detailed, hierarchical context containing project o
 Strict Rules of Engagement:
 1. Ground every statement strictly in the provided code context. Do NOT generalize, invent, or hallucinate behaviors, files, or symbols.
 2. Cite exact qualified names, file paths, and line numbers.
-3. Adopt a highly technical, rigorous, and direct tone. Explain the 'WHY' behind the architecture, not just the 'WHAT'. Explain why components exist, what roles they serve, and how they contribute to the system's runtime semantics.
+3. Adopt a highly technical, rigorous, and direct tone. Do NOT merely describe retrieved functions. Instead, explain the 'WHY' behind the architecture: explain orchestration responsibility, subsystem purpose, execution significance, architectural intent, downstream impact, and how components contribute to the system's runtime semantics.
 4. Do NOT use generic chatbot conversational filler (e.g. "Sure! Here is...", "As an AI..."). Speak directly as a senior engineering lead.
 5. If the context does not contain enough information, explain exactly what is missing and state the limits of the analyzed code.
 """
@@ -312,6 +312,7 @@ class CodeIntelligence:
         repo_name: str,
         symbol_name: str,
         depth: int = 2,
+        direction: str = "downstream",
     ) -> dict:
         """
         Return the dependency chain for a symbol.
@@ -320,9 +321,10 @@ class CodeIntelligence:
             repo_name: Repository name.
             symbol_name: Symbol to analyze (simple or qualified name).
             depth: BFS depth for dependency traversal.
+            direction: 'downstream' (what this calls), 'upstream' (what calls this), 'bidirectional'.
 
         Returns:
-            Dict with direct and transitive dependency lists.
+            Dict with direct and transitive dependency lists and edge metadata.
         """
         graph, registry, _, _ = self._load_repo(repo_name)
 
@@ -339,8 +341,33 @@ class CodeIntelligence:
         if not node_id:
             return {"error": f"Symbol '{entry.qualified_name}' not in graph."}
 
-        direct_deps = graph.get_neighbors_by_edge_type(node_id, "CALLS")
-        transitive_deps = graph.get_dependencies(node_id, depth=depth)
+        # Resolve direct and transitive based on direction
+        if direction == "upstream":
+            direct_deps = graph.get_neighbors_by_edge_type(node_id, "CALLS", reverse=True)
+            transitive_deps = graph.get_dependents(node_id, depth=depth)
+        elif direction == "bidirectional":
+            direct_down = graph.get_neighbors_by_edge_type(node_id, "CALLS", reverse=False)
+            direct_up = graph.get_neighbors_by_edge_type(node_id, "CALLS", reverse=True)
+            direct_deps = list(set(direct_down + direct_up))
+
+            transitive_down = graph.get_dependencies(node_id, depth=depth)
+            transitive_up = graph.get_dependents(node_id, depth=depth)
+            transitive_deps = list(set(transitive_down + transitive_up))
+        elif direction == "impact":
+            impact_res = graph.get_impact(node_id)
+            direct_deps = impact_res.directly_affected
+            transitive_deps = impact_res.transitively_affected
+        elif direction == "execution":
+            from app.graph.flow_reconstructor import ExecutionFlowReconstructor
+            reconstructor = ExecutionFlowReconstructor(graph)
+            trace_data = reconstructor.trace_execution_flow(node_id, max_depth=depth + 1)
+            steps = trace_data.get("steps", [])
+            # depth 1 is direct, depth > 1 is transitive
+            direct_deps = [step["node_id"] for step in steps if step["depth"] == 1]
+            transitive_deps = [step["node_id"] for step in steps if step["depth"] > 1]
+        else: # default downstream
+            direct_deps = graph.get_neighbors_by_edge_type(node_id, "CALLS", reverse=False)
+            transitive_deps = graph.get_dependencies(node_id, depth=depth)
 
         def node_ids_to_names(node_ids: list[str]) -> list[str]:
             names = []
@@ -350,13 +377,34 @@ class CodeIntelligence:
                     names.append(data.get("qualified_name", nid))
             return names
 
+        # Gather edge metadata for direct dependencies
+        edge_meta = {}
+        for nid in direct_deps:
+            if graph.graph.has_edge(node_id, nid):
+                edata = graph.graph.edges[node_id, nid]
+            elif graph.graph.has_edge(nid, node_id):
+                edata = graph.graph.edges[nid, node_id]
+            else:
+                edata = {}
+
+            meta_qn = graph.get_node_data(nid).get("qualified_name", nid) if graph.get_node_data(nid) else nid
+            edge_meta[meta_qn] = {
+                "resolution_type": edata.get("resolution_type", "unresolved"),
+                "confidence": edata.get("confidence", 0.0),
+                "evidence": edata.get("evidence", ""),
+                "provenance": edata.get("provenance", "none")
+            }
+
         return {
             "symbol": entry.qualified_name,
             "file_path": entry.file_path,
+            "direction": direction,
             "direct_dependencies": node_ids_to_names(direct_deps),
             "transitive_dependencies": node_ids_to_names(transitive_deps),
             "dependency_depth": depth,
+            "edge_metadata": edge_meta,
         }
+
 
     def analyze_impact(
         self,

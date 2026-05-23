@@ -326,7 +326,19 @@ class CodeGraph:
                     if callee_id and callee_id != caller_id:
                         res_type = getattr(call, "resolution_type", "unresolved")
                         res_val = res_type.value if hasattr(res_type, "value") else str(res_type)
-                        self._add_edge(caller_id, callee_id, _CALLS_EDGE, resolution_type=res_val)
+                        conf_val = getattr(call, "confidence", 0.0)
+                        ev_val = getattr(call, "evidence", "")
+                        prov_val = getattr(call, "provenance", "none")
+                        self._add_edge(
+                            caller_id,
+                            callee_id,
+                            _CALLS_EDGE,
+                            resolution_type=res_val,
+                            confidence=conf_val,
+                            evidence=ev_val,
+                            provenance=prov_val
+                        )
+
 
         logger.info(
             "Phase 4 complete: %d nodes, %d edges",
