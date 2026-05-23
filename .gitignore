@@ -1,0 +1,10 @@
+coderr_data/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+test_qdrant/
+venv/
+.idea/
+.vscode/
+*.log

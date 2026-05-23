@@ -1,0 +1,24 @@
+# CLI & API
+typer[all]>=0.12.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# ML / Embeddings
+sentence-transformers>=3.0.0
+
+# Vector Store (local file mode — no Docker)
+qdrant-client>=1.9.0
+
+# Graph
+networkx>=3.3
+
+# Display / Formatting
+rich>=13.7.0
+
+# Testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
