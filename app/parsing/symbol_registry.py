@@ -123,6 +123,7 @@ class SymbolRegistry:
                         file_path=pf.path,
                         class_name=None,
                         line_start=cls.line_start,
+                        bases=cls.bases,
                     )
                 )
                 for method in cls.methods:
@@ -191,18 +192,20 @@ class SymbolRegistry:
             # 1. Resolve top-level functions (without class context)
             for fn in pf.functions:
                 for call in fn.calls:
-                    resolved, res_type = self._resolve_call_name(
+                    resolved, res_type, confidence, evidence, provenance = self._resolve_call_name(
                         call.name,
                         pf.module_name,
                         import_map,
                         fn_assignments=fn.assignments,
                     )
+                    call.resolved = resolved
+                    call.resolution_type = res_type
+                    call.confidence = confidence
+                    call.evidence = evidence
+                    call.provenance = provenance
                     if resolved:
-                        call.resolved = resolved
-                        call.resolution_type = res_type
                         resolved_count += 1
                     else:
-                        call.resolution_type = ResolutionType.UNRESOLVED
                         unresolved_count += 1
 
             # 2. Resolve class methods (with class and self assignments)
@@ -210,7 +213,7 @@ class SymbolRegistry:
                 class_assignments = cls.assignments
                 for fn in cls.methods:
                     for call in fn.calls:
-                        resolved, res_type = self._resolve_call_name(
+                        resolved, res_type, confidence, evidence, provenance = self._resolve_call_name(
                             call.name,
                             pf.module_name,
                             import_map,
@@ -218,12 +221,14 @@ class SymbolRegistry:
                             class_assignments=class_assignments,
                             calling_class_qn=cls.qualified_name,
                         )
+                        call.resolved = resolved
+                        call.resolution_type = res_type
+                        call.confidence = confidence
+                        call.evidence = evidence
+                        call.provenance = provenance
                         if resolved:
-                            call.resolved = resolved
-                            call.resolution_type = res_type
                             resolved_count += 1
                         else:
-                            call.resolution_type = ResolutionType.UNRESOLVED
                             unresolved_count += 1
 
         logger.debug(
@@ -231,6 +236,33 @@ class SymbolRegistry:
             resolved_count,
             unresolved_count,
         )
+
+    def _find_class_constructor(self, class_qn: str, calling_module: str, import_map: dict[str, str]) -> Optional[str]:
+        """Find the __init__ method for a class, searching up the inheritance tree if needed."""
+        # 1. Direct constructor
+        init_qn = f"{class_qn}.__init__"
+        if init_qn in self._symbols:
+            return init_qn
+            
+        # 2. Inherited constructor
+        class_entry = self._symbols.get(class_qn)
+        if class_entry and hasattr(class_entry, "bases"):
+            queue = list(class_entry.bases)
+            visited = set(class_entry.bases)
+            while queue:
+                base = queue.pop(0)
+                resolved_base, _, _, _, _ = self._resolve_call_name(base, calling_module, import_map, skip_constructor_resolve=True)
+                if resolved_base:
+                    cand = f"{resolved_base}.__init__"
+                    if cand in self._symbols:
+                        return cand
+                    curr_entry = self._symbols.get(resolved_base)
+                    if curr_entry and hasattr(curr_entry, "bases"):
+                        for parent in curr_entry.bases:
+                            if parent not in visited:
+                                visited.add(parent)
+                                queue.append(parent)
+        return None
 
     def _resolve_call_name(
         self,
@@ -240,84 +272,200 @@ class SymbolRegistry:
         fn_assignments: dict[str, str] = None,
         class_assignments: dict[str, str] = None,
         calling_class_qn: Optional[str] = None,
-    ) -> tuple[Optional[str], ResolutionType]:
+        skip_constructor_resolve: bool = False,
+    ) -> tuple[Optional[str], ResolutionType, float, str, str]:
         """
         Resolve a raw call name to a fully-qualified symbol name.
-        Returns (resolved_name, resolution_type).
+        Returns (resolved_name, resolution_type, confidence, evidence, provenance).
         """
         from app.schemas.models import ResolutionType
         if not raw_name:
-            return None, ResolutionType.UNRESOLVED
+            return None, ResolutionType.UNRESOLVED, 0.0, "Empty raw name", "none"
 
-        # --- 0. Framework / Callable Instance Call Resolution ---
+        resolved = None
+        res_type = ResolutionType.UNRESOLVED
+        confidence = 0.0
+        evidence = "Unresolved static call"
+        provenance = "none"
+
+        _GENERIC_METHOD_NAMES = frozenset({
+            "__init__", "__call__", "forward", "fit", "predict", "save", "load",
+            "run", "start", "stop", "close", "open", "update", "delete", "create",
+            "get", "post", "put", "patch", "options", "head", "main", "execute"
+        })
+
+        # --- 0. super() Constructor & Method Resolution ---
+        if raw_name.startswith("super.") and calling_class_qn:
+            method_name = raw_name.split(".", 1)[1]
+            class_entry = self._symbols.get(calling_class_qn)
+            if class_entry and hasattr(class_entry, "bases"):
+                queue = list(class_entry.bases)
+                visited_bases = set(class_entry.bases)
+                while queue:
+                    base = queue.pop(0)
+                    resolved_base, _, _, _, _ = self._resolve_call_name(base, calling_module, import_map, skip_constructor_resolve=True)
+                    if resolved_base:
+                        candidate = f"{resolved_base}.{method_name}"
+                        if candidate in self._symbols:
+                            resolved = candidate
+                            res_type = ResolutionType.DIRECT
+                            confidence = 1.0
+                            evidence = f"super call resolved to base class method: {resolved}"
+                            provenance = "inheritance"
+                            break
+                        curr_entry = self._symbols.get(resolved_base)
+                        if curr_entry and hasattr(curr_entry, "bases"):
+                            for parent in curr_entry.bases:
+                                if parent not in visited_bases:
+                                    visited_bases.add(parent)
+                                    queue.append(parent)
+                if resolved:
+                    # Apply constructor mapping check before returning
+                    if not skip_constructor_resolve and resolved in self._symbols:
+                        entry = self._symbols[resolved]
+                        if entry.symbol_type == SymbolType.CLASS:
+                            constructor_qn = self._find_class_constructor(resolved, calling_module, import_map)
+                            if constructor_qn:
+                                return constructor_qn, res_type, confidence, f"Class instantiation resolved to constructor: {constructor_qn}", provenance
+                    return resolved, res_type, confidence, evidence, provenance
+
+        # --- 1. Framework / Callable Instance Call Resolution ---
         # e.g., model(x) where model maps to a class like GPT, or self(x)
         if "." not in raw_name:
             if raw_name == "self" and calling_class_qn:
                 forward_qn = f"{calling_class_qn}.forward"
                 if forward_qn in self._symbols:
-                    return forward_qn, ResolutionType.DIRECT
-                call_qn = f"{calling_class_qn}.__call__"
-                if call_qn in self._symbols:
-                    return call_qn, ResolutionType.DIRECT
+                    resolved = forward_qn
+                    res_type = ResolutionType.DIRECT
+                    confidence = 1.0
+                    evidence = f"self instance call resolved directly to forward: {resolved}"
+                    provenance = "static"
+                else:
+                    call_qn = f"{calling_class_qn}.__call__"
+                    if call_qn in self._symbols:
+                        resolved = call_qn
+                        res_type = ResolutionType.DIRECT
+                        confidence = 1.0
+                        evidence = f"self instance call resolved directly to __call__: {resolved}"
+                        provenance = "static"
             
             elif fn_assignments and raw_name in fn_assignments:
                 raw_class = fn_assignments[raw_name]
-                resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                resolved_class, _, _, _, _ = self._resolve_call_name(raw_class, calling_module, import_map, skip_constructor_resolve=True)
                 if resolved_class:
                     forward_qn = f"{resolved_class}.forward"
                     if forward_qn in self._symbols:
-                        return forward_qn, ResolutionType.HEURISTIC
-                    call_qn = f"{resolved_class}.__call__"
-                    if call_qn in self._symbols:
-                        return call_qn, ResolutionType.HEURISTIC
+                        resolved = forward_qn
+                        res_type = ResolutionType.HEURISTIC
+                        confidence = 0.8
+                        evidence = f"Local callable instance variable '{raw_name}' mapped to forward: {resolved}"
+                        provenance = "heuristic"
+                    else:
+                        call_qn = f"{resolved_class}.__call__"
+                        if call_qn in self._symbols:
+                            resolved = call_qn
+                            res_type = ResolutionType.HEURISTIC
+                            confidence = 0.8
+                            evidence = f"Local callable instance variable '{raw_name}' mapped to __call__: {resolved}"
+                            provenance = "heuristic"
 
-        # --- 1. Direct import map ---
-        if raw_name in import_map:
-            candidate = import_map[raw_name]
-            return candidate, ResolutionType.IMPORT
+        # --- 2. Direct import map ---
+        if not resolved and raw_name in import_map:
+            resolved = import_map[raw_name]
+            res_type = ResolutionType.IMPORT
+            confidence = 1.0
+            evidence = f"Explicitly imported local name: {resolved}"
+            provenance = "static"
 
-        # --- 2. Attribute & Method Resolution Heuristics ---
-        if "." in raw_name:
+        # --- 3. Attribute & Method Resolution Heuristics ---
+        if not resolved and "." in raw_name:
             parts = raw_name.rsplit(".", 1)
             prefix = parts[0]
             method = parts[1]
 
-            # 2a. Calls to self: self.my_method() or self.model()
+            # 3a. Calls to self: self.my_method() or self.model()
             if prefix == "self" and calling_class_qn:
                 candidate = f"{calling_class_qn}.{method}"
                 if candidate in self._symbols:
-                    return candidate, ResolutionType.DIRECT
-                
+                    resolved = candidate
+                    res_type = ResolutionType.DIRECT
+                    confidence = 1.0
+                    evidence = f"Direct method call on self: {resolved}"
+                    provenance = "static"
+                else:
+                    # Check base classes for self.method()
+                    class_entry = self._symbols.get(calling_class_qn)
+                    if class_entry and hasattr(class_entry, "bases"):
+                        queue = list(class_entry.bases)
+                        visited_bases = set(class_entry.bases)
+                        while queue:
+                            base = queue.pop(0)
+                            resolved_base, _, _, _, _ = self._resolve_call_name(base, calling_module, import_map, skip_constructor_resolve=True)
+                            if resolved_base:
+                                cand = f"{resolved_base}.{method}"
+                                if cand in self._symbols:
+                                    resolved = cand
+                                    res_type = ResolutionType.DIRECT
+                                    confidence = 1.0
+                                    evidence = f"Inherited method call on self resolved to base class: {resolved}"
+                                    provenance = "inheritance"
+                                    break
+                                curr_entry = self._symbols.get(resolved_base)
+                                if curr_entry and hasattr(curr_entry, "bases"):
+                                    for parent in curr_entry.bases:
+                                        if parent not in visited_bases:
+                                            visited_bases.add(parent)
+                                            queue.append(parent)
+
                 # Check if it is a self attribute call (like self.model()) mapping to a callable class
-                if class_assignments and raw_name in class_assignments:
+                if not resolved and class_assignments and raw_name in class_assignments:
                     raw_class = class_assignments[raw_name]
-                    resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                    resolved_class, _, _, _, _ = self._resolve_call_name(raw_class, calling_module, import_map, skip_constructor_resolve=True)
                     if resolved_class:
                         forward_qn = f"{resolved_class}.forward"
                         if forward_qn in self._symbols:
-                            return forward_qn, ResolutionType.HEURISTIC
-                        call_qn = f"{resolved_class}.__call__"
-                        if call_qn in self._symbols:
-                            return call_qn, ResolutionType.HEURISTIC
+                            resolved = forward_qn
+                            res_type = ResolutionType.HEURISTIC
+                            confidence = 0.8
+                            evidence = f"Self attribute instance variable '{raw_name}' mapped to forward: {resolved}"
+                            provenance = "heuristic"
+                        else:
+                            call_qn = f"{resolved_class}.__call__"
+                            if call_qn in self._symbols:
+                                resolved = call_qn
+                                res_type = ResolutionType.HEURISTIC
+                                confidence = 0.8
+                                evidence = f"Self attribute instance variable '{raw_name}' mapped to __call__: {resolved}"
+                                provenance = "heuristic"
 
-            # 2b. Calls to self attribute: self.model.forward()
+            # 3b. Calls to self attribute: self.model.forward()
             elif prefix.startswith("self.") and class_assignments and prefix in class_assignments:
                 raw_class = class_assignments[prefix]
-                resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                resolved_class, _, _, _, _ = self._resolve_call_name(raw_class, calling_module, import_map, skip_constructor_resolve=True)
                 if resolved_class:
                     candidate = f"{resolved_class}.{method}"
-                    return candidate, ResolutionType.HEURISTIC
+                    if candidate in self._symbols:
+                        resolved = candidate
+                        res_type = ResolutionType.HEURISTIC
+                        confidence = 0.8
+                        evidence = f"Method call on self attribute: {resolved}"
+                        provenance = "heuristic"
 
-            # 2c. Calls to local variables: trainer.fit()
+            # 3c. Calls to local variables: trainer.fit()
             elif fn_assignments and prefix in fn_assignments:
                 raw_class = fn_assignments[prefix]
-                resolved_class, _ = self._resolve_call_name(raw_class, calling_module, import_map)
+                resolved_class, _, _, _, _ = self._resolve_call_name(raw_class, calling_module, import_map, skip_constructor_resolve=True)
                 if resolved_class:
                     candidate = f"{resolved_class}.{method}"
-                    return candidate, ResolutionType.HEURISTIC
+                    if candidate in self._symbols:
+                        resolved = candidate
+                        res_type = ResolutionType.HEURISTIC
+                        confidence = 0.8
+                        evidence = f"Method call on local variable instance: {resolved}"
+                        provenance = "heuristic"
 
-        # --- 3. Dotted prefix (e.g. "jwt.decode") ---
-        if "." in raw_name:
+        # --- 4. Dotted prefix (e.g. "jwt.decode") ---
+        if not resolved and "." in raw_name:
             parts = raw_name.split(".", 1)
             prefix = parts[0]
             rest = parts[1]
@@ -326,32 +474,101 @@ class SymbolRegistry:
                 resolved_prefix = import_map[prefix]
                 candidate = f"{resolved_prefix}.{rest}"
                 if candidate in self._symbols:
-                    return candidate, ResolutionType.IMPORT
-                matches = self._suffix_match(raw_name)
-                if matches:
-                    return matches[0], ResolutionType.HEURISTIC
-                return candidate, ResolutionType.IMPORT
+                    resolved = candidate
+                    res_type = ResolutionType.IMPORT
+                    confidence = 1.0
+                    evidence = f"Dotted prefix resolved via import: {resolved}"
+                    provenance = "static"
+                else:
+                    # Suffix match only if not a generic method name
+                    last_seg = rest.split(".")[-1]
+                    if last_seg not in _GENERIC_METHOD_NAMES:
+                        matches = self._suffix_match(raw_name)
+                        if matches:
+                            resolved = matches[0]
+                            res_type = ResolutionType.HEURISTIC
+                            confidence = 0.5
+                            evidence = f"Fallback suffix match on dotted import prefix: {resolved}"
+                            provenance = "heuristic"
 
-        # --- 4. Same-module (called without import, defined in same file) ---
-        same_module_candidate = f"{calling_module}.{raw_name}"
-        if same_module_candidate in self._symbols:
-            return same_module_candidate, ResolutionType.DIRECT
+        # --- 5. Same-module (called without import, defined in same file) ---
+        if not resolved:
+            same_module_candidate = f"{calling_module}.{raw_name}"
+            if same_module_candidate in self._symbols:
+                resolved = same_module_candidate
+                res_type = ResolutionType.DIRECT
+                confidence = 1.0
+                evidence = f"Same-module function/class call: {resolved}"
+                provenance = "static"
 
-        # --- 5. Exact global lookup ---
-        if raw_name in self._symbols:
-            return raw_name, ResolutionType.IMPORT
+        # --- 6. Exact global lookup ---
+        if not resolved and raw_name in self._symbols:
+            resolved = raw_name
+            res_type = ResolutionType.IMPORT
+            confidence = 1.0
+            evidence = f"Exact global symbol registry match: {resolved}"
+            provenance = "static"
 
-        # --- 6. Suffix match in symbol table ---
-        suffix_matches = self._suffix_match(raw_name)
-        if suffix_matches:
-            return suffix_matches[0], ResolutionType.HEURISTIC
+        # --- 7. Framework-Aware Execution / Call Inference ---
+        if not resolved:
+            # Detect common neural network / module instance calls, e.g. model(x) or self.model(x)
+            last_seg = raw_name.split(".")[-1]
+            if last_seg.lower() in ("model", "net", "network", "module", "gpt", "backbone", "layer", "encoder", "decoder", "classifier"):
+                nn_module_classes = []
+                for qn, entry in self._symbols.items():
+                    if entry.symbol_type == SymbolType.CLASS:
+                        # Subclass defining forward or __call__
+                        if f"{qn}.forward" in self._symbols or f"{qn}.__call__" in self._symbols:
+                            nn_module_classes.append(qn)
 
-        return None, ResolutionType.UNRESOLVED
+                candidate_models = []
+                for qn in nn_module_classes:
+                    name_lower = qn.split(".")[-1].lower()
+                    # Suppress common helper/normalization block classes to avoid incorrect path mapping
+                    if any(layer in name_lower for layer in ("layernorm", "norm", "embedding", "linear", "attention", "mlp", "block", "loss")):
+                        continue
+                    candidate_models.append(qn)
 
-    def _find_in_symbols_by_module(self, module: str) -> bool:
-        """Check if any symbol's qualified name starts with the given module."""
-        prefix = module + "."
-        return any(k.startswith(prefix) for k in self._symbols)
+                if not candidate_models:
+                    candidate_models = nn_module_classes # fallback
+
+                if candidate_models:
+                    # Select the most significant orchestrating module (longest path is repository-defined main model)
+                    candidate_models.sort(key=lambda qn: len(self._symbols.get(f"{qn}.__init__").file_path if f"{qn}.__init__" in self._symbols else ""), reverse=True)
+                    best_model = candidate_models[0]
+                    target_method = f"{best_model}.forward" if f"{best_model}.forward" in self._symbols else f"{best_model}.__call__"
+                    if target_method in self._symbols:
+                        resolved = target_method
+                        res_type = ResolutionType.HEURISTIC
+                        confidence = 0.5
+                        evidence = f"Generalized framework inference: {raw_name} -> {resolved}"
+                        provenance = "framework_inferred"
+
+        # --- 8. Suffix match in symbol table ---
+        if not resolved:
+            last_seg = raw_name.split(".")[-1]
+            if last_seg not in _GENERIC_METHOD_NAMES:
+                suffix_matches = self._suffix_match(raw_name)
+                if suffix_matches:
+                    resolved = suffix_matches[0]
+                    res_type = ResolutionType.HEURISTIC
+                    confidence = 0.5
+                    evidence = f"Fallback suffix match in symbol table: {resolved}"
+                    provenance = "heuristic"
+
+        # --- 9. Class Instantiation mapping to Constructor ---
+        if resolved and resolved in self._symbols and not skip_constructor_resolve:
+            entry = self._symbols[resolved]
+            if entry.symbol_type == SymbolType.CLASS:
+                constructor_qn = self._find_class_constructor(resolved, calling_module, import_map)
+                if constructor_qn:
+                    return constructor_qn, res_type, confidence, f"Class instantiation resolved to constructor: {constructor_qn}", provenance
+
+        if resolved:
+            return resolved, res_type, confidence, evidence, provenance
+
+        return None, ResolutionType.UNRESOLVED, 0.0, "Unresolved static call", "none"
+
 
     def _suffix_match(self, name: str) -> list[str]:
         """
@@ -372,6 +589,7 @@ class SymbolRegistry:
         if entry.qualified_name not in self._name_index[simple_name]:
             self._name_index[simple_name].append(entry.qualified_name)
 
+
     # ------------------------------------------------------------------
     # Query API
     # ------------------------------------------------------------------
@@ -391,8 +609,9 @@ class SymbolRegistry:
         # We need the module name for same-module resolution
         # Find it from any symbol in this file
         calling_module = self._get_module_for_file(file_path)
-        resolved, _ = self._resolve_call_name(call_name, calling_module, import_map)
+        resolved, _, _, _, _ = self._resolve_call_name(call_name, calling_module, import_map)
         return resolved
+
 
     def get_symbol(self, qualified_name: str) -> Optional[SymbolRegistryEntry]:
         """Look up a symbol by its exact qualified name."""

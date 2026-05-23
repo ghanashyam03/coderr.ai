@@ -456,3 +456,102 @@ def test_framework_entrypoint_filtering() -> None:
     assert "app.cli.unused_helper" in dead_candidates
 
 
+def test_super_constructor_resolution() -> None:
+    """Verify super().__init__() in a child class resolves to parent __init__."""
+    p1 = "/repo/app/base.py"
+    p2 = "/repo/app/child.py"
+    m1 = "app.base"
+    m2 = "app.child"
+
+    # Base class with constructor
+    base_init = _fn("__init__", m1, p1, class_name="BaseClass", line_start=3, line_end=6, source="def __init__(self):\n    self.x = 1")
+    base_class = _cls("BaseClass", m1, p1, methods=[base_init])
+    f1 = ParsedFile(path=p1, module_name=m1, classes=[base_class])
+
+    # Child class calling super().__init__()
+    child_init = _fn("__init__", m2, p2, class_name="ChildClass", line_start=3, line_end=6, source="def __init__(self):\n    super().__init__()", calls=[ParsedCall(name="super.__init__", line=4)])
+    child_class = _cls("ChildClass", m2, p2, bases=["BaseClass"], methods=[child_init])
+    f2 = ParsedFile(
+        path=p2,
+        module_name=m2,
+        imports=[ParsedImport(module=m1, names=["BaseClass"], line=2, is_from=True)],
+        classes=[child_class]
+    )
+
+    parsed_files = [f1, f2]
+    registry = build_registry(parsed_files)
+
+    # Verify resolution in child class constructor
+    resolved_call = f2.classes[0].methods[0].calls[0]
+    assert resolved_call.resolved == "app.base.BaseClass.__init__"
+    assert resolved_call.resolution_type.value in ("direct", "import")
+
+
+def test_generic_method_suffix_exclusion() -> None:
+    """Verify that calling an unresolved save() does NOT fall back to a random class's save method."""
+    p1 = "/repo/app/model.py"
+    p2 = "/repo/app/main.py"
+    m1 = "app.model"
+    m2 = "app.main"
+
+    # ModelClass with a save method
+    model_save = _fn("save", m1, p1, class_name="ModelClass", line_start=3, line_end=6, source="def save(self): pass")
+    model_class = _cls("ModelClass", m1, p1, methods=[model_save])
+    f1 = ParsedFile(path=p1, module_name=m1, classes=[model_class])
+
+    # main.py calling save() as an unresolved global function call
+    main_fn = _fn("main", m2, p2, line_start=2, line_end=5, source="def main():\n    save()", calls=[ParsedCall(name="save", line=3)])
+    f2 = ParsedFile(path=p2, module_name=m2, functions=[main_fn])
+
+    parsed_files = [f1, f2]
+    registry = build_registry(parsed_files)
+
+    # Since save is in _GENERIC_METHOD_NAMES, suffix matching must be blocked
+    resolved_call = f2.functions[0].calls[0]
+    assert resolved_call.resolved is None
+    assert resolved_call.resolution_type.value == "unresolved"
+
+
+def test_strict_entrypoint_computational_suppression() -> None:
+    """Verify that LayerNorm.forward is never classified as an entrypoint, even with 0 incoming callers."""
+    p1 = "/repo/app/layers.py"
+    m1 = "app.layers"
+
+    # LayerNorm.forward method
+    forward_fn = _fn("forward", m1, p1, class_name="LayerNorm", line_start=3, line_end=8, source="def forward(self, x): return x")
+    layernorm_class = _cls("LayerNorm", m1, p1, methods=[forward_fn])
+    f1 = ParsedFile(path=p1, module_name=m1, classes=[layernorm_class])
+
+    parsed_files = [f1]
+    registry = build_registry(parsed_files)
+    graph = CodeGraph()
+    graph.build(parsed_files, registry)
+
+    reconstructor = ExecutionFlowReconstructor(graph)
+    entrypoints = reconstructor.find_all_entrypoints()
+
+    # LayerNorm.forward must be suppressed
+    forward_node_id = _func_node_id("app.layers.LayerNorm.forward")
+    assert forward_node_id not in entrypoints
+
+
+def test_upstream_downstream_dependency_traversal(sample_arch_repo) -> None:
+    """Verify that upstream, downstream, and bidirectional dependency traversals return correct sets."""
+    registry = build_registry(sample_arch_repo)
+    graph = CodeGraph()
+    graph.build(sample_arch_repo, registry)
+
+    auth_node_id = _func_node_id("app.services.authenticate_user")
+    
+    # Downstream (dependencies)
+    downstream = graph.get_dependencies(auth_node_id, depth=1)
+    assert _func_node_id("app.utils.db_lookup") in downstream
+    assert _func_node_id("app.utils.log_info") in downstream
+    assert _func_node_id("app.orchestrator.Orchestrator.login") not in downstream
+
+    # Upstream (dependents)
+    upstream = graph.get_dependents(auth_node_id, depth=1)
+    assert _func_node_id("app.orchestrator.Orchestrator.login") in upstream
+    assert _func_node_id("app.utils.db_lookup") not in upstream
+
+

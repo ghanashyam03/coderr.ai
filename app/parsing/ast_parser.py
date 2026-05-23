@@ -52,9 +52,12 @@ def _resolve_attr_name(node: ast.expr) -> str:
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "super":
+            return f"super.{node.attr}"
         parent = _resolve_attr_name(node.value)
         return f"{parent}.{node.attr}" if parent else node.attr
     return ""
+
 
 
 def _get_decorator_name(node: ast.expr) -> str:

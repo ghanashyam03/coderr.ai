@@ -213,6 +213,12 @@ def cmd_dependencies(
     symbol: str = typer.Argument(..., help="Symbol name to analyze dependencies for."),
     repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Repository name."),
     depth: int = typer.Option(2, "--depth", "-d", help="BFS traversal depth."),
+    direction: str = typer.Option(
+        "downstream",
+        "--direction",
+        "-dir",
+        help="Dependency direction ('downstream', 'upstream', 'bidirectional', 'impact', 'execution').",
+    ),
     log_level: str = typer.Option("WARNING", "--log-level"),
 ) -> None:
     """Show the dependency chain for a symbol (what it depends on)."""
@@ -222,7 +228,9 @@ def cmd_dependencies(
     intelligence = _get_intelligence()
 
     try:
-        result = intelligence.get_dependencies(repo_name=repo_name, symbol_name=symbol, depth=depth)
+        result = intelligence.get_dependencies(
+            repo_name=repo_name, symbol_name=symbol, depth=depth, direction=direction
+        )
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -233,14 +241,27 @@ def cmd_dependencies(
 
     console.print(Panel(
         f"[bold]{result['symbol']}[/bold]\n"
-        f"[dim]{result['file_path']}[/dim]",
+        f"[dim]{result['file_path']}[/dim]\n"
+        f"[dim]Direction: {result['direction']} | BFS Depth: {result['dependency_depth']}[/dim]",
         title="Dependency Analysis",
         border_style="cyan",
     ))
 
     console.print(f"\n[bold cyan]Direct Dependencies ({len(result['direct_dependencies'])}):[/bold cyan]")
+    edge_meta = result.get("edge_metadata", {})
     for dep in result["direct_dependencies"]:
-        console.print(f"  → [green]{dep}[/green]")
+        meta = edge_meta.get(dep)
+        if meta and meta.get("resolution_type") != "unresolved":
+            conf = meta.get("confidence", 1.0)
+            prov = meta.get("provenance", "none")
+            evidence = meta.get("evidence", "")
+            meta_str = f" [dim](confidence: {conf:.1f}, provenance: {prov}"
+            if evidence:
+                meta_str += f" | {evidence}"
+            meta_str += ")[/dim]"
+        else:
+            meta_str = ""
+        console.print(f"  → [green]{dep}[/green]{meta_str}")
 
     if result.get("transitive_dependencies"):
         console.print(f"\n[bold yellow]Transitive Dependencies ({len(result['transitive_dependencies'])}):[/bold yellow]")

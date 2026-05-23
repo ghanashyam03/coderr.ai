@@ -29,8 +29,22 @@ class ExecutionFlowReconstructor:
         if data.get("node_type") != "function":
             return False
 
-        # Heuristic 1: Main block / entrypoint names
+        qn = data.get("qualified_name", "").lower()
         name_lower = data.get("name", "").lower()
+
+        # Suppress internal computational methods from being entrypoints
+        if name_lower in ("forward", "__init__", "backward", "step"):
+            return False
+
+        # Suppress computational class methods
+        parts = qn.split(".")
+        class_name = data.get("symbol_type") == "method" and len(parts) >= 2 and parts[-2]
+        if class_name:
+            class_name_lower = class_name.lower()
+            if any(layer in class_name_lower for layer in ("layernorm", "norm", "embedding", "linear", "attention", "mlp", "block", "layer", "module", "loss")):
+                return False
+
+        # Heuristic 1: Main block / entrypoint names
         if name_lower in ("main", "run", "start", "execute", "handler", "entrypoint"):
             return True
 
@@ -45,15 +59,21 @@ class ExecutionFlowReconstructor:
         if any("task" in dec.lower() or "schedule" in dec.lower() for dec in decorators):
             return True
 
-        # Heuristic 4: Graph Root (no incoming CALLS edges)
+        # Heuristic 4: Graph Root (no incoming CALLS edges) - STRICT entrypoint file check
         has_caller = any(
             self.graph.graph.edges[pred, node_id].get("edge_type") == "CALLS"
             for pred in self.graph.graph.predecessors(node_id)
         )
         if not has_caller:
-            return True
+            from pathlib import Path
+            file_path = data.get("file_path", "").lower()
+            file_name = Path(file_path).name
+            is_entry_file = any(kw in file_name for kw in ("main", "cli", "server", "app", "run", "route", "api", "entry"))
+            if is_entry_file or name_lower in ("main", "run", "start", "execute", "handler", "entrypoint"):
+                return True
 
         return False
+
 
     def find_all_entrypoints(self) -> list[str]:
         """Find all nodes that qualify as likely entrypoints in the repository."""

@@ -54,6 +54,9 @@ class ParsedCall(BaseModel):
     line: int = 0
     resolved: Optional[str] = None  # fully-qualified name after symbol registry resolution
     resolution_type: ResolutionType = ResolutionType.UNRESOLVED
+    confidence: float = 0.0
+    evidence: str = ""
+    provenance: str = "none"
 
 
 class ParsedFunction(BaseModel):
@@ -118,6 +121,8 @@ class SymbolRegistryEntry(BaseModel):
     file_path: str
     class_name: Optional[str] = None
     line_start: int = 0
+    bases: list[str] = Field(default_factory=list)
+
 
 
 class ImportResolution(BaseModel):
